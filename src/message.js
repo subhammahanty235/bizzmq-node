@@ -1,5 +1,6 @@
 class Message{
-    constructor(queue_name, message, options={}){
+    constructor(queue_name,message_id, message, options={}){
+        this.message_id = message_id
         this.queue_name = queue_name;
         this.message = message;
         this.status = 'waiting' //default lifecycle state
@@ -31,6 +32,7 @@ class Message{
 
     tojson(){
         return {
+            message_id:this.message_id,
             queue_name: this.queue_name,
             message: this.message,
             status: this.status,
