@@ -9,7 +9,7 @@ class Message{
         this.options = {
             priority: options.priority || 0,
             retries: options.retries || 1,
-            dead_letter_queue_enable: options.dead_letter_queue_enable || false,
+            
         }
         this.retries_made = 0;
     }
@@ -27,7 +27,6 @@ class Message{
     }
 
     incrementRetries(){
-
     }
 
     tojson(){

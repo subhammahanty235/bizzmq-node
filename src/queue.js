@@ -58,17 +58,40 @@ class BizzMQ {
     async consumeMessageFromQueue(queuename, callback) {
         const queueKey = `queue:${queuename}`;
         const subscriber = this.redis.duplicate();
+        const queue_meta_key = `queue_meta:${queuename}`;
+
+        //get queue options
+        const queueOptions = await this.redis.hgetall(queue_meta_key);
+        const useDeadLetterQueue = queueOptions.dead_letter_queue === 'true' || queueOptions.dead_letter_queue === true;
+        const maxRetries = parseInt(queueOptions.maxRetries || 3);
+
+
 
         // this function will process the jobs or messages using the provided callback
         const processJob = async (message) => {
             try {
                 const parsedMessage = JSON.parse(message);
-                await callback(parsedMessage); // Execute job callback
+                await callback(parsedMessage);
             } catch (err) {
+                try {
 
-                console.error("❌ Error processing job:", err);
+                    const parsedMessage = JSON.parse(message);
+                    if (useDeadLetterQueue) {
+                        if (maxRetries > 0) {
+                            await this.retryMessage(queuename, message, err);
+                        } else {
+                            await this.moveMessageToDLQ(queuename, message, err);
+                        }
+                    } else {
+                        console.log(`⚠️ Message failed but no DLQ configured `);
+                    }
+                } catch (dlqerror) {
+                    console.error(`❌ Error handling failed message:`, dlqerror);
+                }
             }
         };
+
+
 
         // this function will process all the existing elements that are in the queue
         const processExistingJobs = async () => {
@@ -147,13 +170,50 @@ class BizzMQ {
                 retryTimestamp: Date.now()
             };
             await this.redis.lpush(`queue:${queuename}`, JSON.stringify(parsedMessage));
-            console.log(`🔄 Message requeued for retry (${retryCount}/${maxRetries}) - ID: ${parsedMessage.id}`);
+            console.log(`🔄 Message requeued for retry (${retryCount}/${maxRetries}) - ID: ${parsedMessage.message_id}`);
             return true;
         } else {
             await this.moveToDeadLetterQueue(queuename, parsedMessage, error);
             return false;
         }
 
+    }
+
+    // Utility function to get DLQ messages for inspection or reprocessing
+    async getDeadLetterMessages(queuename, limit = 100) {
+        const dlq_name = `${queuename}_dlq`;
+        const dlq_key = `queue:${dlq_name}`;
+        const dlq_meta_key = `queue_meta:${dlq_name}`
+        const isExists = await this.redis.exists(dlq_meta_key);
+        if (!isExists) {
+            throw new Error(`❌ Dead Letter Queue for "${queuename}" does not exist.`);
+        }
+        const messages = await this.redis.lrange(dlq_key, 0, limit - 1);
+        return messages.map(msg => JSON.parse(msg));
+    }
+
+    //utility function to retry a fail message from dead letter queue using the messageId, for manual use
+    async retryDeadLetterMessage(queuename, messageId) {
+        const dlq_name = `${queuename}_dlq`;
+        const dlq_key = `queue:${dlq_name}`;
+        const dlq_meta_key = `queue_meta:${dlq_name}`
+        const messages = await this.redis.lrange(dlq_key, 0, -1);
+        for (let i = 0; i < messages.length; i++) {
+            const message = JSON.parse(messages[i]);
+
+            if (message.message_id === messageId) {
+                await this.redis.lrem(dlq_key, 1, messages[i]);
+
+                // Reset retry count and publish back to original queue
+                message.retries_mades = 0;
+                message.timestamp_updated = Date.now();
+
+                // Publish to the original queue
+                await this.publishMessageToQueue(queuename, message.message, message.options);
+                console.log(`🔄 Message ${messageId} moved from DLQ back to "${queuename}"`);
+                return true;
+            }
+        }
     }
 }
 
