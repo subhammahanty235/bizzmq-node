@@ -10,10 +10,8 @@ class BizzMQ {
     // it will check if there's any queue exists in the redis instance as same name, if yes then it will skip the operation, else it will create the queue
 
     async createQueue(queuename, options = {}) {
+
         const queue_meta_key = `queue_meta:${queuename}`
-        if(options.dead_letter_queue){
-            console.log("Dead Letter queue wanted")
-        }
         //check if queue exists
         const isExists = await this.redis.exists(queue_meta_key)
         if (isExists) {
@@ -22,6 +20,21 @@ class BizzMQ {
         }
 
         await this.redis.hset(queue_meta_key, { createdAt: Date.now(), ...options });
+
+        if (options.config_dead_letter_queue) {
+            const dlq_name = `${queuename}_dlq`;
+            const dlq_meta_key = `queue_meta:${dlq_name}`;
+            const dlq_exists = await this.redis.exists(dlq_meta_key)
+            if (!dlq_exists) {
+                await this.redis.hset(dlq_meta_key, {
+                    createdAt: Date.now(),
+                    isDeadLetterQueue: true,
+                    parentQueue: queuename,
+                    retry: options.retry || 0,
+                    maxRetries: options.maxRetries || 0,
+                })
+            }
+        }
         console.log(`📌 Queue "${queuename}" created successfully.`)
     }
 
@@ -44,9 +57,9 @@ class BizzMQ {
 
     async consumeMessageFromQueue(queuename, callback) {
         const queueKey = `queue:${queuename}`;
-        const subscriber = this.redis.duplicate(); // Separate connection for Pub/Sub
+        const subscriber = this.redis.duplicate();
 
-        // Set up the actual job processing function
+        // this function will process the jobs or messages using the provided callback
         const processJob = async (message) => {
             try {
                 const parsedMessage = JSON.parse(message);
@@ -75,6 +88,7 @@ class BizzMQ {
             }
         });
 
+
         const fallbackInterval = setInterval(async () => {
             const message = await this.redis.rpop(queueKey);
             if (message) {
@@ -92,7 +106,55 @@ class BizzMQ {
 
     }
 
+    async moveMessageToDLQ(queuename, message, error) {
+        const queue_meta_key = `queue_meta:${queuename}`;
+        const queueOptions = await this.redis.hgetall(queue_meta_key);
 
+        if (!queueOptions.dead_letter_queue) {
+            console.log(`⚠️ No Dead Letter Queue configured for "${queuename}". Failed message discarded.`);
+            return;
+        }
+
+        const dlqName = `${queuename}_dlq`;
+        const parsedMessage = typeof message === 'string' ? JSON.parse(message) : message;
+
+        parsedMessage.error = {
+            message: error.message,
+            stack: error.stack,
+            timestamp: Date.now()
+        };
+
+        await this.publishMessageToQueue(dlqName, parsedMessage.data, {
+            ...parsedMessage.options,
+            originalQueue: queuename,
+            failedAt: Date.now()
+        });
+
+
+    }
+
+    async requeueMessage(queuename, message, error) {
+        const queue_meta_key = `queue_meta:${queuename}`;
+        const queueOptions = await this.redis.hgetall(queue_meta_key);
+        const maxRetries = parseInt(queueOptions.maxRetries || 3);
+        let parsedMessage = typeof message === 'string' ? JSON.parse(message) : message;
+        const retryCount = (parsedMessage.options?.retryCount || 0) + 1;
+        if (retryCount <= maxRetries) {
+            parsedMessage.options = {
+                ...parsedMessage.options,
+                retryCount,
+                lastError: error.message,
+                retryTimestamp: Date.now()
+            };
+            await this.redis.lpush(`queue:${queuename}`, JSON.stringify(parsedMessage));
+            console.log(`🔄 Message requeued for retry (${retryCount}/${maxRetries}) - ID: ${parsedMessage.id}`);
+            return true;
+        } else {
+            await this.moveToDeadLetterQueue(queuename, parsedMessage, error);
+            return false;
+        }
+
+    }
 }
 
 module.exports = BizzMQ
