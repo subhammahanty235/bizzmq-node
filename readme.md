@@ -72,7 +72,7 @@ async function main() {
   
   // Create a queue with Dead Letter Queue enabled
   await mq.createQueue('email-queue', {
-    dead_letter_queue: true,  // Enable DLQ
+    config_dead_letter_queue: true,  // Enable DLQ
     maxRetries: 3             // Try 3 times before moving to DLQ
   });
   
@@ -123,7 +123,7 @@ async function example() {
   const mq = new BizzMQ('redis://localhost:6379');
   
   // Create a queue with DLQ enabled
-  await mq.createQueue('firstqueue', {dead_letter_queue: true});
+  await mq.createQueue('firstqueue', {config_dead_letter_queue: true});
   
   // Prepare job data
   const jobData = {
@@ -186,7 +186,7 @@ Creates a new queue. If the queue already exists, this operation is skipped.
 
 - `queueName` (String): Name of the queue to create
 - `options` (Object): Queue configuration options
-  - `dead_letter_queue` (Boolean): Whether to create a DLQ for this queue (default: false)
+  - `config_dead_letter_queue` (Boolean): Whether to create a DLQ for this queue (default: false)
   - `maxRetries` (Number): Maximum number of retry attempts before sending to DLQ (default: 3)
 
 #### `async publishMessageToQueue(queueName, message, options)`
@@ -250,11 +250,3 @@ When job processing fails (callback throws an error):
 3. **Include relevant metadata** in your job data for easier debugging
 4. **Check your DLQ regularly** for repeated failures that might indicate systemic issues
 5. **Implement graceful shutdown** by calling the cleanup function returned by `consumeMessageFromQueue`
-
-## License
-
-MIT
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
