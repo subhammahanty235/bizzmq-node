@@ -78,7 +78,7 @@ class BizzMQ {
                     const parsedMessage = JSON.parse(message);
                     if (useDeadLetterQueue) {
                         if (maxRetries > 0) {
-                            await this.retryMessage(queuename, message, err);
+                            await this.requeueMessage(queuename, message, err);
                         } else {
                             await this.moveMessageToDLQ(queuename, message, err);
                         }
