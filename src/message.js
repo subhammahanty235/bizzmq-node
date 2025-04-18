@@ -3,7 +3,7 @@ class Message{
         this.message_id = message_id
         this.queue_name = queue_name;
         this.message = message;
-        this.status = 'waiting' //default lifecycle state
+        this.status = 'waiting'
         this.timestamp_created = new Date()
         this.timestamp_updated = this.timestamp_created;
         this.options = {
@@ -22,8 +22,16 @@ class Message{
         4. Failed --> Message is failed during processing, in this case we will check if retries needed or we can simply drop it
         5. Requeued --> If message is failed then we will add it to Dead Letter Queue and processed again
     */
-    updateLifecycleStatus (){
+    updateLifecycleStatus (newStatus){
+        const valid_statuses = ['waiting', 'processing', 'processed', 'failed', 'requeued'];
+        if(!valid_statuses.includes(newStatus)){
+            throw new Error(`Invalid status: ${newStatus}. Must be one of: ${valid_statuses(', ')}`)
+        }
 
+        this.status = newStatus;
+        this.timestamp_updated = new Date();
+
+        return this;
     }
 
     incrementRetries(){

@@ -18,17 +18,20 @@ class BizzMQ {
             console.log(`✅ Queue "${queuename}" already exists.`)
             return;
         }
-
-        await this.redis.hset(queue_meta_key, { createdAt: Date.now(), ...options });
+        if(options.config_dead_letter_queue){
+            options.dead_letter_queue = true
+        }
+        await this.redis.hset(queue_meta_key, { createdAt: Date.now() , ...options});
 
         if (options.config_dead_letter_queue) {
             const dlq_name = `${queuename}_dlq`;
             const dlq_meta_key = `queue_meta:${dlq_name}`;
             const dlq_exists = await this.redis.exists(dlq_meta_key)
             if (!dlq_exists) {
+               
                 await this.redis.hset(dlq_meta_key, {
                     createdAt: Date.now(),
-                    isDeadLetterQueue: true,
+                    dead_letter_queue: true,
                     parentQueue: queuename,
                     retry: options.retry || 0,
                     maxRetries: options.maxRetries || 0,
@@ -62,25 +65,49 @@ class BizzMQ {
 
         //get queue options
         const queueOptions = await this.redis.hgetall(queue_meta_key);
+        
         const useDeadLetterQueue = queueOptions.dead_letter_queue === 'true' || queueOptions.dead_letter_queue === true;
         const maxRetries = parseInt(queueOptions.maxRetries || 3);
 
 
 
         // this function will process the jobs or messages using the provided callback
-        const processJob = async (message) => {
+        const processJob = async (messageString) => {
             try {
-                const parsedMessage = JSON.parse(message);
+                let parsedMessage = JSON.parse(messageString);
+                let messageObj = new Message(
+                    parsedMessage.queue_name,
+                    parsedMessage.message_id,
+                    parsedMessage.message,
+                    parsedMessage.options
+                );
+                 //Lifecycle update ====  waiting ---> processing 
+                messageObj.updateLifecycleStatus('processing');
+
                 await callback(parsedMessage);
+
+                //Lifecycle update ====  processing ---> processed
+                messageObj.updateLifecycleStatus('processed');
             } catch (err) {
                 try {
 
-                    const parsedMessage = JSON.parse(message);
+                    const parsedMessage = JSON.parse(messageString);
+                    let messageObj = new Message(
+                        parsedMessage.queue_name,
+                        parsedMessage.message_id,
+                        parsedMessage.message,
+                        parsedMessage.options
+                    );
+
+                   //Lifecycle update ====  processing ---> failed
+                    messageObj.updateLifecycleStatus("failed")
+
+                    messageObj.retries_made = parsedMessage.retries_made || 0;
                     if (useDeadLetterQueue) {
                         if (maxRetries > 0) {
-                            await this.requeueMessage(queuename, message, err);
+                            await this.requeueMessage(queuename, messageObj, err);
                         } else {
-                            await this.moveMessageToDLQ(queuename, message, err);
+                            await this.moveMessageToDLQ(queuename, messageObj, err);
                         }
                     } else {
                         console.log(`⚠️ Message failed but no DLQ configured `);
@@ -120,6 +147,7 @@ class BizzMQ {
                 await processExistingJobs();
             }
         }, 5000);
+
         console.log(`📡 Listening for jobs on ${queuename}...`);
         return () => {
             clearInterval(fallbackInterval);
@@ -129,7 +157,7 @@ class BizzMQ {
 
     }
 
-    async moveMessageToDLQ(queuename, message, error) {
+    async moveMessageToDLQ(queuename, messageObj, error) {
         const queue_meta_key = `queue_meta:${queuename}`;
         const queueOptions = await this.redis.hgetall(queue_meta_key);
 
@@ -139,8 +167,9 @@ class BizzMQ {
         }
 
         const dlqName = `${queuename}_dlq`;
-        const parsedMessage = typeof message === 'string' ? JSON.parse(message) : message;
+        const parsedMessage = typeof messageObj === 'string' ? JSON.parse(messageObj) : messageObj;
 
+        messageObj.updateLifecycleStatus('failed', error);
         parsedMessage.error = {
             message: error.message,
             stack: error.stack,
@@ -156,24 +185,28 @@ class BizzMQ {
 
     }
 
-    async requeueMessage(queuename, message, error) {
+    async requeueMessage(queuename, messageObj, error) {
         const queue_meta_key = `queue_meta:${queuename}`;
         const queueOptions = await this.redis.hgetall(queue_meta_key);
         const maxRetries = parseInt(queueOptions.maxRetries || 3);
-        let parsedMessage = typeof message === 'string' ? JSON.parse(message) : message;
-        const retryCount = (parsedMessage.options?.retryCount || 0) + 1;
-        if (retryCount <= maxRetries) {
+        let parsedMessage = typeof messageObj === 'string' ? JSON.parse(messageObj) : messageObj;
+        const retryCount = ( messageObj.retries_made || 0) + 1;
+        messageObj.updateLifecycleStatus('requeued' );
+        if (!messageObj.options) {
+            messageObj.options = {};
+        }
+        messageObj.retries_made =  messageObj.retries_made +1 ;
+        if (retryCount <= maxRetries ) {
+           
             parsedMessage.options = {
-                ...parsedMessage.options,
-                retryCount,
+                ...messageObj.options,
                 lastError: error.message,
                 retryTimestamp: Date.now()
             };
             await this.redis.lpush(`queue:${queuename}`, JSON.stringify(parsedMessage));
-            console.log(`🔄 Message requeued for retry (${retryCount}/${maxRetries}) - ID: ${parsedMessage.message_id}`);
             return true;
         } else {
-            await this.moveToDeadLetterQueue(queuename, parsedMessage, error);
+            await this.moveMessageToDLQ(queuename, parsedMessage, error);
             return false;
         }
 
@@ -200,13 +233,23 @@ class BizzMQ {
         const messages = await this.redis.lrange(dlq_key, 0, -1);
         for (let i = 0; i < messages.length; i++) {
             const message = JSON.parse(messages[i]);
-
+            
             if (message.message_id === messageId) {
+                
                 await this.redis.lrem(dlq_key, 1, messages[i]);
 
                 // Reset retry count and publish back to original queue
                 message.retries_mades = 0;
                 message.timestamp_updated = Date.now();
+
+                const messageObj = new Message(
+                    message.queue_name,
+                    message.message_id,
+                    message.message,
+                    message.options
+                );
+
+                messageObj.updateLifecycleStatus('waiting');
 
                 // Publish to the original queue
                 await this.publishMessageToQueue(queuename, message.message, message.options);
