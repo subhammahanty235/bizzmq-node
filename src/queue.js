@@ -18,17 +18,17 @@ class BizzMQ {
             console.log(`✅ Queue "${queuename}" already exists.`)
             return;
         }
-        if(options.config_dead_letter_queue){
+        if (options.config_dead_letter_queue) {
             options.dead_letter_queue = true
         }
-        await this.redis.hset(queue_meta_key, { createdAt: Date.now() , ...options});
+        await this.redis.hset(queue_meta_key, { createdAt: Date.now(), ...options });
 
         if (options.config_dead_letter_queue) {
             const dlq_name = `${queuename}_dlq`;
             const dlq_meta_key = `queue_meta:${dlq_name}`;
             const dlq_exists = await this.redis.exists(dlq_meta_key)
             if (!dlq_exists) {
-               
+
                 await this.redis.hset(dlq_meta_key, {
                     createdAt: Date.now(),
                     dead_letter_queue: true,
@@ -52,8 +52,20 @@ class BizzMQ {
         }
 
         const messageId = `message:${Date.now()}`;
+        if (!options.priority) {
+            options.priority = 0;
+        }
+
+        const timestamp = Date.now();
+        const score = options.priority * 1e10 + timestamp;
+       
+
         const messageobj = new Message(queuename, messageId, message, options);
-        await this.redis.lpush(queueKey, JSON.stringify(messageobj.tojson()));
+        //Previous implementation : List based implementation
+        // await this.redis.lpush(queueKey, JSON.stringify(messageobj.tojson()));
+        //New implementation : Sorted set based implementation
+        await this.redis.zadd(queueKey, score, JSON.stringify(messageobj.tojson()));
+
         this.redis.publish(queueKey, messageId);
         console.log(`📩 Job added to queue "${queuename}" - ID: ${messageId}`);
     }
@@ -65,7 +77,7 @@ class BizzMQ {
 
         //get queue options
         const queueOptions = await this.redis.hgetall(queue_meta_key);
-        
+
         const useDeadLetterQueue = queueOptions.dead_letter_queue === 'true' || queueOptions.dead_letter_queue === true;
         const maxRetries = parseInt(queueOptions.maxRetries || 3);
 
@@ -81,10 +93,10 @@ class BizzMQ {
                     parsedMessage.message,
                     parsedMessage.options
                 );
-                 //Lifecycle update ====  waiting ---> processing 
+                //Lifecycle update ====  waiting ---> processing 
                 messageObj.updateLifecycleStatus('processing');
 
-                await callback(parsedMessage);
+                await callback(parsedMessage.message);
 
                 //Lifecycle update ====  processing ---> processed
                 messageObj.updateLifecycleStatus('processed');
@@ -99,7 +111,7 @@ class BizzMQ {
                         parsedMessage.options
                     );
 
-                   //Lifecycle update ====  processing ---> failed
+                    //Lifecycle update ====  processing ---> failed
                     messageObj.updateLifecycleStatus("failed")
 
                     messageObj.retries_made = parsedMessage.retries_made || 0;
@@ -122,10 +134,23 @@ class BizzMQ {
 
         // this function will process all the existing elements that are in the queue
         const processExistingJobs = async () => {
-            let message = await this.redis.rpop(queueKey);
-            while (message) {
+            //Previous implementation : List based implementation
+            // let message = await this.redis.rpop(queueKey);
+            // while (message) {
+            //     await processJob(message);
+            //     message = await this.redis.rpop(queueKey);
+            // }
+
+            let entries = await this.redis.zrange(queueKey, 0, 0); // get the highest-priority (lowest-score) job
+            while (entries.length > 0) {
+                const message = entries[0];
+
+                // Remove it before processing (to avoid duplicate processing if crash occurs during callback)
+                await this.redis.zrem(queueKey, message);
+
                 await processJob(message);
-                message = await this.redis.rpop(queueKey);
+
+                entries = await this.redis.zrange(queueKey, 0, 0);
             }
         };
 
@@ -138,12 +163,29 @@ class BizzMQ {
             }
         });
 
+        //Previous implementation : List based implementation
+        // const fallbackInterval = setInterval(async () => {
+        //     const message = await this.redis.rpop(queueKey);
+        //     if (message) {
+        //         console.log(`⚠️ Fallback found unprocessed job`);
+        //         await processJob(message);
+        //         await processExistingJobs();
+        //     }
+        // }, 5000);
 
+        //New implementation : Sorted set based implementation
         const fallbackInterval = setInterval(async () => {
-            const message = await this.redis.rpop(queueKey);
-            if (message) {
+            const entries = await this.redis.zrange(queueKey, 0, 0); // get highest-priority job
+            if (entries.length > 0) {
+                const message = entries[0];
+        
+                // Remove before processing
+                await this.redis.zrem(queueKey, message);
+        
                 console.log(`⚠️ Fallback found unprocessed job`);
                 await processJob(message);
+        
+                // Continue processing any remaining jobs
                 await processExistingJobs();
             }
         }, 5000);
@@ -190,20 +232,28 @@ class BizzMQ {
         const queueOptions = await this.redis.hgetall(queue_meta_key);
         const maxRetries = parseInt(queueOptions.maxRetries || 3);
         let parsedMessage = typeof messageObj === 'string' ? JSON.parse(messageObj) : messageObj;
-        const retryCount = ( messageObj.retries_made || 0) + 1;
-        messageObj.updateLifecycleStatus('requeued' );
+        const retryCount = (messageObj.retries_made || 0) + 1;
+        messageObj.updateLifecycleStatus('requeued');
         if (!messageObj.options) {
-            messageObj.options = {};
+            messageObj.options = {
+                priority: 0
+            };
         }
-        messageObj.retries_made =  messageObj.retries_made +1 ;
-        if (retryCount <= maxRetries ) {
-           
+        messageObj.retries_made = messageObj.retries_made + 1;
+        if (retryCount <= maxRetries) {
+
             parsedMessage.options = {
                 ...messageObj.options,
                 lastError: error.message,
                 retryTimestamp: Date.now()
             };
-            await this.redis.lpush(`queue:${queuename}`, JSON.stringify(parsedMessage));
+            const timestamp = Date.now();
+            const score = messageObj.options.priority * 1e10 + timestamp;
+            //Previous implementation : List based implementation
+            // await this.redis.lpush(`queue:${queuename}`, JSON.stringify(parsedMessage));
+            //New implementation : Sorted set based implementation
+            await this.redis.zadd(`queue:${queuename}`, score, JSON.stringify(parsedMessage));
+
             return true;
         } else {
             await this.moveMessageToDLQ(queuename, parsedMessage, error);
@@ -221,7 +271,7 @@ class BizzMQ {
         if (!isExists) {
             throw new Error(`❌ Dead Letter Queue for "${queuename}" does not exist.`);
         }
-        const messages = await this.redis.lrange(dlq_key, 0, limit - 1);
+        const messages = await this.redis.zrange(dlq_key, 0, limit - 1);
         return messages.map(msg => JSON.parse(msg));
     }
 
@@ -230,16 +280,19 @@ class BizzMQ {
         const dlq_name = `${queuename}_dlq`;
         const dlq_key = `queue:${dlq_name}`;
         const dlq_meta_key = `queue_meta:${dlq_name}`
-        const messages = await this.redis.lrange(dlq_key, 0, -1);
+        
+        // Get all messages from DLQ
+        const messages = await this.redis.zrange(dlq_key, 0, -1);
+        
         for (let i = 0; i < messages.length; i++) {
             const message = JSON.parse(messages[i]);
-            
+
             if (message.message_id === messageId) {
-                
-                await this.redis.lrem(dlq_key, 1, messages[i]);
+                // Remove the message from DLQ
+                await this.redis.zrem(dlq_key, messages[i]);
 
                 // Reset retry count and publish back to original queue
-                message.retries_mades = 0;
+                message.retries_made = 0;
                 message.timestamp_updated = Date.now();
 
                 const messageObj = new Message(
