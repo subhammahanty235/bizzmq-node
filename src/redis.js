@@ -20,7 +20,7 @@ class RedisClient {
 function printWelcomeMessage() {
   console.log("╔════════════════════════════════════════════════════════════╗");
   console.log("║                                                            ║");
-  console.log("║   🚀 BizzMQ Queue System v1.1.0 (Early Release)            ║");
+  console.log("║   🚀 BizzMQ Queue System v1.2.0 (Early Release)            ║");
   console.log("║         A lightweight message queue for node.js            ║");
   console.log("║                                                            ║");
   console.log("╠════════════════════════════════════════════════════════════╣");
